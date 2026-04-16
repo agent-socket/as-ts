@@ -178,6 +178,64 @@ test("send blocks until connected", async () => {
   }
 });
 
+test("send rejects on non-transient error without spinning", async () => {
+  // Build a server that accepts the connection so the ws is OPEN.
+  const server = await startServer(() => {});
+
+  const agent = connect("tok", "as:test/me", () => {}, {
+    endpoint: server.url,
+    minBackoffMs: 50,
+  });
+
+  try {
+    // BigInt is not JSON-serialisable — JSON.stringify throws, which
+    // should propagate out of agent.send() instead of being treated
+    // as a retryable transport error.
+    const badPayload = { n: 1n } as unknown;
+    // Wait briefly so the socket is live (send path reaches ws.send).
+    await new Promise((r) => setTimeout(r, 100));
+    await assert.rejects(
+      agent.send("as:test/peer", badPayload),
+      (err: unknown) => err instanceof TypeError,
+    );
+  } finally {
+    await agent.close();
+    await server.stop();
+  }
+});
+
+test("dispatch does not lose messages under tight enqueue timing", async () => {
+  // Server sends a burst of frames as fast as it can; an async
+  // handler that yields once between messages stresses the
+  // dispatch-queue drain/kick race.
+  const BURST = 50;
+  const server = await startServer((_attempt, conn) => {
+    for (let i = 0; i < BURST; i++) {
+      conn.send(JSON.stringify({ from: "as:test/sender", data: { i } }));
+    }
+  });
+
+  let seen = 0;
+  const agent = connect(
+    "tok",
+    "as:test/me",
+    async (m: Message) => {
+      if (m.err) return;
+      await Promise.resolve(); // yield, inviting the race
+      seen += 1;
+    },
+    { endpoint: server.url, minBackoffMs: 50 },
+  );
+
+  try {
+    await waitFor(() => (seen >= BURST ? true : null), 3000);
+    assert.equal(seen, BURST);
+  } finally {
+    await agent.close();
+    await server.stop();
+  }
+});
+
 test("handler can reply without deadlocking", async () => {
   const replies: unknown[] = [];
   const server = await startServer((_attempt, conn) => {

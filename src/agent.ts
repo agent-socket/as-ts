@@ -12,7 +12,7 @@
 
 import { AgentClosedError, ServerError } from "./errors.js";
 import { Message } from "./message.js";
-import { WSClient } from "./ws.js";
+import { NotConnectedError, WSClient } from "./ws.js";
 
 export const DEFAULT_ENDPOINT = "wss://as.agent-socket.ai";
 const DEFAULT_MIN_BACKOFF_MS = 500;
@@ -135,8 +135,11 @@ export class Agent {
         try {
           await ws.send(to, payload);
           return;
-        } catch {
-          // Dropped mid-send. Fall through to wait for reconnect.
+        } catch (err) {
+          // Only a NotConnectedError is retryable — the connection
+          // dropped before or during the write. Any other error
+          // (serialization failure, etc.) is terminal for this send.
+          if (!(err instanceof NotConnectedError)) throw err;
         }
       }
 
@@ -151,8 +154,13 @@ export class Agent {
    */
   async close(): Promise<void> {
     this.stopController.abort();
-    if (this.ws !== null) {
-      await this.ws.close();
+    // Snapshot the current WS ref before the supervisor can swap it
+    // for a new cycle. Closing a stale ref is a no-op; the risk we're
+    // avoiding is calling close() on a freshly-dialed next-cycle
+    // connection we didn't mean to terminate.
+    const ws = this.ws;
+    if (ws !== null) {
+      await ws.close();
     }
     await this.donePromise;
   }
@@ -255,14 +263,19 @@ export class Agent {
 
   private enqueue(msg: Message): void {
     this.dispatchQueue.push(msg);
-    if (!this.dispatchRunning) {
-      this.dispatchRunning = true;
-      queueMicrotask(() => void this.drain());
-    }
+    this.kickDrain();
+  }
+
+  private kickDrain(): void {
+    if (this.dispatchRunning) return;
+    this.dispatchRunning = true;
+    queueMicrotask(() => void this.drain());
   }
 
   private async drain(): Promise<void> {
     try {
+      // Re-check in a tight loop so an enqueue that lands between
+      // the last shift() and the flag reset is never lost.
       while (this.dispatchQueue.length > 0) {
         const m = this.dispatchQueue.shift()!;
         try {
@@ -273,6 +286,10 @@ export class Agent {
       }
     } finally {
       this.dispatchRunning = false;
+      // Close the race window: if an enqueue arrived after the last
+      // shift() observed an empty queue but before we flipped the
+      // flag, kick a new drain so the message is not orphaned.
+      if (this.dispatchQueue.length > 0) this.kickDrain();
     }
   }
 

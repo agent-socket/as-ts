@@ -20,6 +20,19 @@ export interface CloseInfo {
   reason: string;
 }
 
+/**
+ * Thrown by {@link WSClient.send} when the underlying socket is not
+ * in the OPEN state. Distinct from arbitrary write failures so the
+ * caller can distinguish "retry after reconnect" from "this payload
+ * cannot be sent on any connection".
+ */
+export class NotConnectedError extends Error {
+  constructor() {
+    super("not connected");
+    this.name = "NotConnectedError";
+  }
+}
+
 export class WSClient {
   private ws: WebSocket | null = null;
   private closed = false;
@@ -83,14 +96,22 @@ export class WSClient {
 
       ws.on("unexpected-response", (_req, res) => {
         settled = true;
+        let bodyDone = false;
+        const finishOnce = (fn: () => void) => {
+          if (bodyDone) return;
+          bodyDone = true;
+          fn();
+        };
         const status = res.statusCode ?? 0;
         const chunks: Buffer[] = [];
         res.on("data", (c: Buffer) => chunks.push(c));
-        res.on("end", () => {
-          const body = Buffer.concat(chunks).toString("utf8");
-          reject(parseDialError(status, body));
-        });
-        res.on("error", (err: Error) => reject(err));
+        res.on("end", () =>
+          finishOnce(() => {
+            const body = Buffer.concat(chunks).toString("utf8");
+            reject(parseDialError(status, body));
+          }),
+        );
+        res.on("error", (err: Error) => finishOnce(() => reject(err)));
       });
 
       ws.once("open", () => {
@@ -102,17 +123,35 @@ export class WSClient {
     });
   }
 
-  /** Send a JSON frame on the connection. */
+  /**
+   * Send a JSON frame on the connection.
+   *
+   * Rejects with {@link NotConnectedError} if the socket is not OPEN
+   * (including mid-send drops, where the callback receives an error).
+   * Serialization failures surface as regular `Error`s.
+   */
   send(to: string, data: unknown): Promise<void> {
     return new Promise<void>((resolve, reject) => {
       if (this.ws === null || this.ws.readyState !== WebSocket.OPEN) {
-        reject(new Error("not connected"));
+        reject(new NotConnectedError());
         return;
       }
-      const frame = JSON.stringify({ to, data });
+      let frame: string;
+      try {
+        frame = JSON.stringify({ to, data });
+      } catch (err) {
+        reject(err as Error);
+        return;
+      }
       this.ws.send(frame, (err) => {
-        if (err) reject(err);
-        else resolve();
+        if (err) {
+          // `ws` emits write errors when the socket has closed or is
+          // closing. Treat as a transient "not connected" so the
+          // supervisor retries after reconnect.
+          reject(new NotConnectedError());
+        } else {
+          resolve();
+        }
       });
     });
   }

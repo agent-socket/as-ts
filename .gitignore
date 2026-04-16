@@ -7,3 +7,4 @@ config.json
 bun.lockb
 package-lock.json
 yarn.lock
+# bun.lock (text format) IS committed for reproducible installs.
